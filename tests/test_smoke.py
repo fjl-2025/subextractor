@@ -356,3 +356,24 @@ def test_pipeline_uses_asr_cache(tmp_path: Path) -> None:
     assert result.outputs, "应至少产出 name.orig.srt"
     text = result.outputs[0].read_text(encoding="utf-8-sig")
     assert "hello" in text
+
+
+def test_models_root_frozen_default_and_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """打包版默认模型根为 exe 同级 models/；models-path.txt 可覆盖。"""
+    monkeypatch.setattr(registry, "is_frozen", lambda: True)
+    exe_dir = tmp_path / "SubExtractor"
+    exe_dir.mkdir()
+    monkeypatch.setattr(registry.sys, "executable", str(exe_dir / "SubExtractor.exe"))
+    monkeypatch.delenv(registry.ENV_MODELS_DIR, raising=False)
+
+    assert registry.models_root() == exe_dir / "models"
+
+    custom = tmp_path / "my-models"
+    custom.mkdir()
+    registry.save_models_root_override(custom)
+    try:
+        assert registry.models_root() == custom.resolve()
+    finally:
+        registry.override_file().unlink(missing_ok=True)

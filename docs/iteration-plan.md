@@ -124,6 +124,15 @@
 - 可选 2：术语表（术语替换，不改写引擎）
 - 可选 3：画面硬字幕 OCR 提取（借鉴 video-subtitle-extractor 思路）
 
+> 实现备注（2026-10-15）：
+> - `packaging/subextractor.spec`（onedir）一次产出 `SubExtractor.exe`（GUI，
+>   无控制台）与 `subextractor-cli.exe`（doctor / fetch-model / run）；
+>   模型权重不进包，`build_windows.ps1` 生成 exe 同级 `models/` 骨架与放置说明。
+> - 模型根定位：环境变量 > exe 同级 `models-path.txt`（首启向导写入）
+>   > exe 同级 `models/`；首启向导 `ui/wizard.py` 检测缺失并给中文放置指引。
+> - Janome 词典、faster-whisper 内置 Silero VAD、imageio-ffmpeg 二进制等
+>   通过 spec 的 `collect_all` 收进包；打包版实测 ja→en 全链路通过。
+
 **验收**
 - 干净机器上，模型预置后双击即可用
 - 安装包不含模型权重（体积可控）

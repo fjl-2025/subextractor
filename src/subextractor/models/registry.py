@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 ENV_MODELS_DIR = "SUBEXTRACTOR_MODELS_DIR"
 CHECKSUMS_FILE = "checksums.json"
-_DEFAULT_ROOT = Path(__file__).resolve().parents[3] / "models"
+# 用户在打包版首启向导里选定的模型目录，记录在应用目录下（随安装走，免环境变量）
+OVERRIDE_FILE = "models-path.txt"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_ROOT = _REPO_ROOT / "models"
 
 # faster-whisper 支持的常用档位（多语种档，不含 .en 专用档）
 ASR_SIZES: tuple[str, ...] = ("tiny", "base", "small", "medium", "large-v3")
@@ -85,15 +89,65 @@ EXPECTED_MODELS: tuple[ModelSpec, ...] = (
         "silero-vad",
         "vad",
         "vad/silero-vad",
-        "Silero VAD：静音切分与长音频分片",
+        "Silero VAD：静音切分（faster-whisper 已内置，无需手动放置）",
+        required=False,
     ),
 )
 
 
+def is_frozen() -> bool:
+    """是否运行在 PyInstaller 打包环境中。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def app_dir() -> Path:
+    """应用目录：打包后为 exe 所在目录，开发态为仓库根。"""
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return _REPO_ROOT
+
+
+def override_file() -> Path:
+    """模型目录覆盖文件路径（首启向导写入）。"""
+    return app_dir() / OVERRIDE_FILE
+
+
+def _read_override() -> Path | None:
+    path = override_file()
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return None
+    candidate = Path(text)
+    return candidate if candidate.is_dir() else None
+
+
+def save_models_root_override(path: str | Path) -> Path:
+    """把用户选定的模型目录写入覆盖文件，下次启动生效。"""
+    target = Path(path)
+    if not target.is_dir():
+        raise FileNotFoundError(f"模型目录不存在：{target}")
+    override_file().write_text(str(target.resolve()), encoding="utf-8")
+    return override_file()
+
+
 def models_root() -> Path:
-    """模型根目录，支持环境变量覆盖。"""
-    override = os.environ.get(ENV_MODELS_DIR)
-    return Path(override) if override else _DEFAULT_ROOT
+    """模型根目录。
+
+    优先级：环境变量 ``SUBEXTRACTOR_MODELS_DIR`` > 应用目录下
+    ``models-path.txt`` 指向的目录 > 打包版 exe 同级 ``models/``
+    > 开发态仓库根 ``models/``。
+    """
+    env_override = os.environ.get(ENV_MODELS_DIR)
+    if env_override:
+        return Path(env_override)
+    custom = _read_override()
+    if custom is not None:
+        return custom
+    if is_frozen():
+        return app_dir() / "models"
+    return _DEFAULT_ROOT
 
 
 def expected_models() -> tuple[ModelSpec, ...]:

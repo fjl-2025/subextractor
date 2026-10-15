@@ -17,7 +17,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -50,6 +50,8 @@ from ..core.errors import PipelineCancelled
 from ..core.pipeline import PipelineConfig, PipelineResult
 from ..core.subtitle import SubtitleDoc
 from ..models import registry
+from ..utils.logging import setup_logging
+from .wizard import ModelWizard
 
 MEDIA_FILTER = "视频/音频 (*.mp4 *.mkv *.mov *.avi *.webm *.mp3 *.m4a *.wav *.flac *.aac *.ogg);;所有文件 (*.*)"
 
@@ -167,8 +169,17 @@ class MainWindow(QMainWindow):
         self._open_dir: Path | None = None
 
         self._build_ui()
+        self._build_menu()
         self._refresh_model_status()  # 先填充档位下拉，_load_settings 才能选中上次档位
         self._load_settings()
+        QTimer.singleShot(150, self._maybe_show_wizard)  # 界面显示后再做首启模型检查
+
+    # ------------------------------------------------------------------ 菜单
+
+    def _build_menu(self) -> None:
+        help_menu = self.menuBar().addMenu("帮助")
+        wizard_action = help_menu.addAction("模型准备向导…")
+        wizard_action.triggered.connect(self._open_wizard)
 
     # ------------------------------------------------------------------ UI 构建
 
@@ -541,6 +552,18 @@ class MainWindow(QMainWindow):
                     combo.setCurrentIndex(idx)
         self.ass_check.setChecked(s.value("emit_ass", False, type=bool))
 
+    # ------------------------------------------------------------------ 首启向导
+
+    def _maybe_show_wizard(self) -> None:
+        """必需模型缺失时（典型为干净机器首次启动）自动弹出向导。"""
+        if registry.missing_models():
+            self._open_wizard()
+
+    def _open_wizard(self) -> None:
+        dialog = ModelWizard(self)
+        dialog.exec()
+        self._refresh_model_status()  # 用户可能在向导里换了模型目录，刷新档位与状态栏
+
     # ------------------------------------------------------------------ 退出
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -564,6 +587,7 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("SubExtractor")
     window = MainWindow()

@@ -22,6 +22,8 @@ models/vad/*
 output/
 cache/
 *.tmp
+models-path.txt
+logs/
 
 # 编辑器 / 系统
 .idea/
