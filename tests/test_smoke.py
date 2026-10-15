@@ -11,7 +11,9 @@ import pytest
 
 from subextractor import __version__
 from subextractor.config import SUPPORTED_TARGET_LANGS, LanguageParams, load_languages
-from subextractor.core import postcheck, segment, translate, writer
+from subextractor.core import batch, cache, postcheck, segment, translate, writer
+from subextractor.core.asr import AsrResult
+from subextractor.core.pipeline import PipelineConfig, PipelineResult, run
 from subextractor.core.subtitle import Segment, SubtitleDoc, Word
 from subextractor.models import registry
 
@@ -204,3 +206,153 @@ def test_postcheck_flags_cps() -> None:
 
     issues = postcheck.check(doc, params)
     assert any("CPS" in issue.message for issue in issues)
+
+
+# ---------------------------------------------------------------- M5 批处理与断点续跑
+
+
+def _asr_result() -> AsrResult:
+    return AsrResult(
+        segments=[Segment(1, "hello", 0.0, 1.0, words=[Word("hello", 0.0, 1.0)])],
+        language="en",
+        language_probability=0.9,
+        duration=1.0,
+    )
+
+
+def test_asr_cache_roundtrip_and_invalidation(tmp_path: Path) -> None:
+    src = tmp_path / "movie.mp4"
+    src.write_bytes(b"0" * 128)
+    cache_dir = tmp_path / "cache"
+
+    cache.save_asr_cache(
+        cache_dir, src, _asr_result(), asr_model="small", source_lang="auto", resolved_size="small"
+    )
+
+    entry = cache.load_asr_cache(cache_dir, src, "small", "auto")
+    assert entry is not None
+    assert entry.resolved_size == "small"
+    assert entry.result.language == "en"
+    assert entry.result.segments[0].text == "hello"
+    assert entry.result.segments[0].words[0].text == "hello"
+    assert entry.result.segments[0].words[0].end == pytest.approx(1.0)
+
+    # 识别配置变更 → 缓存失效
+    assert cache.load_asr_cache(cache_dir, src, "large-v3", "auto") is None
+    assert cache.load_asr_cache(cache_dir, src, "small", "ja") is None
+
+    # 文件被改动（mtime 变化）→ 缓存失效
+    os.utime(src, ns=(0, 1_000_000_000))
+    assert cache.load_asr_cache(cache_dir, src, "small", "auto") is None
+
+
+def test_collect_media_files_filters_and_sorts(tmp_path: Path) -> None:
+    (tmp_path / "b.mp4").write_bytes(b"x")
+    (tmp_path / "a.mkv").write_bytes(b"x")
+    (tmp_path / "A.MP4").write_bytes(b"x")
+    (tmp_path / "note.txt").write_bytes(b"x")
+
+    files = batch.collect_media_files(tmp_path)
+    assert [p.name for p in files] == ["a.mkv", "A.MP4", "b.mp4"]
+
+    single = tmp_path / "b.mp4"
+    assert batch.collect_media_files(single) == [single]
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError):
+        batch.collect_media_files(empty)
+    with pytest.raises(FileNotFoundError):
+        batch.collect_media_files(tmp_path / "missing")
+
+
+def _stub_pipeline_result() -> PipelineResult:
+    doc = SubtitleDoc(source_lang="en")
+    doc.segments.append(Segment(1, "hi", 0.0, 1.0))
+    return PipelineResult(doc=doc, outputs=[], asr_model="stub")
+
+
+def _batch_configs(tmp_path: Path, count: int) -> list[PipelineConfig]:
+    configs = []
+    for i in range(count):
+        path = tmp_path / f"v{i}.mp4"
+        path.write_bytes(b"x")
+        configs.append(PipelineConfig(input_path=path))
+    return configs
+
+
+def test_run_batch_collects_failures(tmp_path: Path) -> None:
+    configs = _batch_configs(tmp_path, 3)
+    done: list[tuple[batch.BatchItemResult, int, int]] = []
+
+    def runner(config, on_progress=None, should_cancel=None, asr_engine=None, translator=None):
+        if config.input_path.name == "v1.mp4":
+            raise RuntimeError("boom")
+        return _stub_pipeline_result()
+
+    result = batch.run_batch(
+        configs, runner=runner, on_item_done=lambda item, i, n, doc: done.append((item, i, n))
+    )
+
+    assert len(result.succeeded) == 2
+    assert len(result.failed) == 1
+    assert result.failed[0].input_path.name == "v1.mp4"
+    assert result.failed[0].error == "boom"
+    assert not result.cancelled
+    assert len(done) == 3
+
+
+def test_run_batch_shares_engines_when_sequential(tmp_path: Path) -> None:
+    configs = _batch_configs(tmp_path, 2)
+    engines: list[tuple[object, object]] = []
+
+    def runner(config, on_progress=None, should_cancel=None, asr_engine=None, translator=None):
+        engines.append((asr_engine, translator))
+        return _stub_pipeline_result()
+
+    batch.run_batch(configs, runner=runner)
+
+    assert engines[0][0] is not None and engines[0][0] is engines[1][0]
+    assert engines[0][1] is not None and engines[0][1] is engines[1][1]
+
+
+def test_run_batch_cancelled_before_start(tmp_path: Path) -> None:
+    configs = _batch_configs(tmp_path, 1)
+    calls: list[PipelineConfig] = []
+
+    def runner(config, **kwargs):
+        calls.append(config)
+        return _stub_pipeline_result()
+
+    result = batch.run_batch(configs, runner=runner, should_cancel=lambda: True)
+
+    assert result.cancelled
+    assert not calls
+    assert not result.succeeded and not result.failed
+
+
+def test_pipeline_uses_asr_cache(tmp_path: Path) -> None:
+    """缓存命中时管线跳过抽音轨+识别，直接产出最终字幕。"""
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"x")
+    cache_dir = tmp_path / "cache"
+    cache.save_asr_cache(
+        cache_dir,
+        src,
+        AsrResult(
+            segments=[Segment(1, "hello world this is a test", 0.0, 2.0)],
+            language="en",
+            language_probability=0.9,
+            duration=2.0,
+        ),
+        asr_model="small",
+        source_lang="auto",
+        resolved_size="small",
+    )
+
+    result = run(PipelineConfig(input_path=src, asr_model="small", cache_dir=cache_dir))
+
+    assert result.asr_model == "small"
+    assert result.outputs, "应至少产出 name.orig.srt"
+    text = result.outputs[0].read_text(encoding="utf-8-sig")
+    assert "hello" in text

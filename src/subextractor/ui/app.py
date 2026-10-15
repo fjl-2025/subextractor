@@ -1,7 +1,7 @@
-"""桌面界面（M4，PySide6）。
+"""桌面界面（M4；M5 起支持目录批处理，PySide6）。
 
 布局（自上而下）：
-1. 输入/输出：文件（拖拽或浏览）、输出目录（可选，默认与输入同目录）
+1. 输入/输出：文件或目录（拖拽或浏览，目录 = 批处理）、输出目录（可选，默认与输入同目录）
 2. 选项：源语、目标语、ASR 档位、翻译引擎、是否输出 ASS
 3. 操作：开始 / 取消 / 打开输出目录，进度条 + 分阶段状态
 4. 结果：postcheck 提示 + 字幕表格预览
@@ -44,9 +44,11 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..config import SUPPORTED_TARGET_LANGS
-from ..core import pipeline
+from ..core import batch, pipeline
+from ..core.cache import default_cache_dir
 from ..core.errors import PipelineCancelled
 from ..core.pipeline import PipelineConfig, PipelineResult
+from ..core.subtitle import SubtitleDoc
 from ..models import registry
 
 MEDIA_FILTER = "视频/音频 (*.mp4 *.mkv *.mov *.avi *.webm *.mp3 *.m4a *.wav *.flac *.aac *.ogg);;所有文件 (*.*)"
@@ -106,6 +108,51 @@ class PipelineWorker(QThread):
             self.succeeded.emit(result)
 
 
+class BatchWorker(QThread):
+    """目录批处理：独立线程逐文件跑管线，逐项回报状态（M5）。"""
+
+    item_started = Signal(int, int, str)  # (序号 1 起, 总数, 文件名)
+    item_done = Signal(object, int, int, object)  # (BatchItemResult, 序号, 总数, SubtitleDoc|None)
+    stage_changed = Signal(str, float)
+    succeeded = Signal(object)  # BatchResult
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, configs: list[PipelineConfig], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._configs = configs
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        """请求取消：当前文件跑完或中止后，不再开始下一个。"""
+        self._cancel_event.set()
+
+    def run(self) -> None:
+        try:
+            result = batch.run_batch(
+                self._configs,
+                should_cancel=self._cancel_event.is_set,
+                on_item_started=lambda index, total, path: self.item_started.emit(
+                    index, total, path.name
+                ),
+                on_item_progress=lambda index, total, stage, progress: self.stage_changed.emit(
+                    f"[{index}/{total}] {stage}", (index - 1 + progress) / total
+                ),
+                on_item_done=lambda item, index, total, doc: self.item_done.emit(
+                    item, index, total, doc
+                ),
+            )
+        except PipelineCancelled:
+            self.cancelled.emit()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(_readable_error(exc))
+        else:
+            if result.cancelled:
+                self.cancelled.emit()
+            else:
+                self.succeeded.emit(result)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -114,9 +161,10 @@ class MainWindow(QMainWindow):
         self.resize(900, 660)
 
         self._settings = QSettings("subextractor", "subextractor")
-        self._worker: PipelineWorker | None = None
+        self._worker: PipelineWorker | BatchWorker | None = None
         self._running = False
         self._result: PipelineResult | None = None
+        self._open_dir: Path | None = None
 
         self._build_ui()
         self._refresh_model_status()  # 先填充档位下拉，_load_settings 才能选中上次档位
@@ -132,12 +180,15 @@ class MainWindow(QMainWindow):
         io_box = QGroupBox("输入 / 输出", central)
         io = QGridLayout(io_box)
         self.input_edit = QLineEdit(io_box)
-        self.input_edit.setPlaceholderText("把视频/音频文件拖到这里，或点击右侧浏览")
+        self.input_edit.setPlaceholderText("把视频/音频文件或整个文件夹拖到这里，或点击右侧浏览")
         input_btn = QPushButton("浏览…", io_box)
         input_btn.clicked.connect(self._choose_input)
-        io.addWidget(QLabel("输入文件", io_box), 0, 0)
+        dir_btn = QPushButton("目录…", io_box)
+        dir_btn.clicked.connect(self._choose_input_dir)
+        io.addWidget(QLabel("输入", io_box), 0, 0)
         io.addWidget(self.input_edit, 0, 1)
         io.addWidget(input_btn, 0, 2)
+        io.addWidget(dir_btn, 0, 3)
 
         self.outdir_edit = QLineEdit(io_box)
         self.outdir_edit.setPlaceholderText("默认与输入文件同目录")
@@ -267,6 +318,13 @@ class MainWindow(QMainWindow):
         if path:
             self.input_edit.setText(path)
 
+    def _choose_input_dir(self) -> None:
+        if self._running:
+            return
+        path = QFileDialog.getExistingDirectory(self, "选择包含视频/音频的目录（批处理）")
+        if path:
+            self.input_edit.setText(path)
+
     def _choose_outdir(self) -> None:
         if self._running:
             return
@@ -281,19 +339,28 @@ class MainWindow(QMainWindow):
             return
         input_text = self.input_edit.text().strip()
         if not input_text:
-            QMessageBox.warning(self, "缺少输入", "请先选择要处理的视频/音频文件。")
+            QMessageBox.warning(self, "缺少输入", "请先选择要处理的视频/音频文件或目录。")
+            return
+
+        try:
+            files = batch.collect_media_files(Path(input_text))
+        except (FileNotFoundError, ValueError) as exc:
+            QMessageBox.warning(self, "输入无效", str(exc))
             return
 
         outdir_text = self.outdir_edit.text().strip()
-        config = PipelineConfig(
-            input_path=Path(input_text),
-            source_lang=self.src_combo.currentData() or "auto",
-            target_lang=self.dst_combo.currentData() or None,
-            asr_model=self.model_combo.currentData() or registry.AUTO,
-            translator=self.engine_combo.currentData() or "nllb",
-            output_dir=Path(outdir_text) if outdir_text else None,
-            emit_ass=self.ass_check.isChecked(),
-        )
+        outdir = Path(outdir_text) if outdir_text else None
+        common = {
+            "source_lang": self.src_combo.currentData() or "auto",
+            "target_lang": self.dst_combo.currentData() or None,
+            "asr_model": self.model_combo.currentData() or registry.AUTO,
+            "translator": self.engine_combo.currentData() or "nllb",
+            "output_dir": outdir,
+            "emit_ass": self.ass_check.isChecked(),
+            "cache_dir": default_cache_dir(outdir or files[0].parent),
+        }
+        configs = [PipelineConfig(input_path=file, **common) for file in files]
+        self._open_dir = outdir or files[0].parent
         self._save_settings()
 
         self._running = True
@@ -303,13 +370,23 @@ class MainWindow(QMainWindow):
         self.open_btn.setEnabled(False)
         self.progress.setValue(0)
         self.stage_label.setText("准备中…")
-        self.notes.hide()
-        self.table.setRowCount(0)
         self._result = None
+        self.table.setRowCount(0)
+        if len(configs) > 1:
+            self.notes.setPlainText("")
+            self.notes.show()
+        else:
+            self.notes.hide()
 
-        self._worker = PipelineWorker(config, parent=self)
+        if len(configs) > 1:
+            self._worker = BatchWorker(configs, parent=self)
+            self._worker.item_started.connect(self._on_item_started)
+            self._worker.item_done.connect(self._on_item_done)
+            self._worker.succeeded.connect(self._on_batch_success)
+        else:
+            self._worker = PipelineWorker(configs[0], parent=self)
+            self._worker.succeeded.connect(self._on_success)
         self._worker.stage_changed.connect(self._on_stage)
-        self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_failed)
         self._worker.cancelled.connect(self._on_cancelled)
         self._worker.finished.connect(self._on_finished)
@@ -363,6 +440,31 @@ class MainWindow(QMainWindow):
         self.stage_label.setText("已取消（临时文件已清理）")
         self.statusBar().showMessage("任务已取消", 3000)
 
+    # ------------------------------------------------------------------ 批处理槽
+
+    def _on_item_started(self, index: int, total: int, name: str) -> None:
+        self.stage_label.setText(f"[{index}/{total}] {name}")
+
+    def _on_item_done(self, item: object, index: int, total: int, doc: object) -> None:
+        assert isinstance(item, batch.BatchItemResult)
+        name = item.input_path.name
+        if item.ok:
+            self.notes.appendPlainText(f"[{index}/{total}] 完成：{name}（{item.cues} 条字幕）")
+            if isinstance(doc, SubtitleDoc):
+                self._fill_table_doc(doc)
+        else:
+            self.notes.appendPlainText(f"[{index}/{total}] 失败：{name}——{item.error}")
+        self.progress.setValue(int(index / total * 100))
+
+    def _on_batch_success(self, result: object) -> None:
+        assert isinstance(result, batch.BatchResult)
+        self.stage_label.setText("完成")
+        self.progress.setValue(100)
+        self.open_btn.setEnabled(True)
+        summary = f"批处理完成：成功 {len(result.succeeded)}｜失败 {len(result.failed)}"
+        self.notes.appendPlainText(summary)
+        self.statusBar().showMessage(summary)
+
     def _on_finished(self) -> None:
         self._running = False
         self._set_inputs_enabled(True)
@@ -385,7 +487,10 @@ class MainWindow(QMainWindow):
         self.notes.show()
 
     def _fill_table(self, result: PipelineResult) -> None:
-        segments = result.doc.segments
+        self._fill_table_doc(result.doc)
+
+    def _fill_table_doc(self, doc: SubtitleDoc) -> None:
+        segments = doc.segments
         self.table.setRowCount(len(segments))
         for row, seg in enumerate(segments):
             values = (
@@ -402,7 +507,9 @@ class MainWindow(QMainWindow):
                 self.table.setItem(row, col, item)
 
     def _open_output_dir(self) -> None:
-        if self._result and self._result.outputs:
+        if self._open_dir is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._open_dir)))
+        elif self._result and self._result.outputs:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._result.outputs[0].parent)))
 
     # ------------------------------------------------------------------ 配置持久化

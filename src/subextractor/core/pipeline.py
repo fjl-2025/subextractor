@@ -5,6 +5,11 @@
 
 断句必须插在识别与翻译之间，译文才能与最终 cue 一一对应；
 ``name.orig.srt`` 反映的也是切分后的最终分段（而非原始 ASR 分段）。
+
+M5 起支持两类复用：
+- ASR 断点缓存（``cache_dir``）：输入指纹与识别配置未变时跳过抽音轨+识别；
+- 共享引擎（``asr_engine`` / ``translator``）：批处理顺序模式下跨文件复用
+  模型，外部传入的对象由调用方负责关闭，内部创建的在退出前自动关闭。
 """
 
 from __future__ import annotations
@@ -17,10 +22,10 @@ from typing import Callable
 from ..config import SUPPORTED_TARGET_LANGS, get_language_params
 from ..models import registry
 from ..utils.logging import get_logger
-from . import asr, media, postcheck, segment, writer
+from . import asr, cache, media, postcheck, segment, writer
 from .errors import PipelineCancelled
 from .subtitle import SubtitleDoc
-from .translate import create_translator
+from .translate import Translator, create_translator
 
 logger = get_logger(__name__)
 
@@ -36,6 +41,7 @@ class PipelineConfig:
     translator: str = "nllb"
     output_dir: Path | None = None
     emit_ass: bool = False
+    cache_dir: Path | None = None  # ASR 断点缓存目录；None 表示不启用
 
     def output_path_for(self, suffix: str) -> Path:
         """输出路径：默认与输入文件同目录、同名词。"""
@@ -62,11 +68,16 @@ def run(
     config: PipelineConfig,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelChecker | None = None,
+    asr_engine: asr.AsrEngine | None = None,
+    translator: Translator | None = None,
 ) -> PipelineResult:
     """执行管线：抽音轨 → 识别 → 断句 →（可选）翻译 → 写字幕文件。
 
     阶段边界与识别/翻译循环内都会检查 ``should_cancel``；取消时抛
     ``PipelineCancelled``，临时音轨由调用处的临时目录上下文自动清理。
+
+    ``asr_engine`` / ``translator`` 供批处理复用已加载的模型；未传时内部
+    自建（翻译引擎用完即关，外部传入的由调用方负责释放）。
     """
 
     def notify(stage: str, progress: float) -> None:
@@ -85,28 +96,54 @@ def run(
     if not source.is_file():
         raise FileNotFoundError(f"输入文件不存在：{source}")
 
-    # 音轨是中间产物，用临时目录承载，识别结束即清理（取消时同样清理）
-    with tempfile.TemporaryDirectory(prefix="subextractor-") as tmp:
-        notify("抽取音轨", 0.0)
-        check_cancelled()
-        audio_path = media.extract_audio(source, Path(tmp) / "audio.wav")
-        logger.info("音轨已抽取：%s", audio_path)
+    if config.cache_dir is not None:
+        cached = cache.load_asr_cache(
+            config.cache_dir, source, config.asr_model, config.source_lang
+        )
+    else:
+        cached = None
 
-        check_cancelled()
-        notify("识别语音", 0.05)
-        engine = asr.AsrEngine(
-            asr.AsrConfig(
-                model_size=config.asr_model,
-                source_lang=config.source_lang,
-                device=config.device,
-                compute_type=config.compute_type,
+    if cached is not None:
+        result = cached.result
+        resolved_size = cached.resolved_size
+        notify("读取缓存", 0.1)
+    else:
+        # 音轨是中间产物，用临时目录承载，识别结束即清理（取消时同样清理）
+        with tempfile.TemporaryDirectory(prefix="subextractor-") as tmp:
+            notify("抽取音轨", 0.0)
+            check_cancelled()
+            audio_path = media.extract_audio(source, Path(tmp) / "audio.wav")
+            logger.info("音轨已抽取：%s", audio_path)
+
+            check_cancelled()
+            notify("识别语音", 0.05)
+            engine = asr_engine or asr.AsrEngine(
+                asr.AsrConfig(
+                    model_size=config.asr_model,
+                    source_lang=config.source_lang,
+                    device=config.device,
+                    compute_type=config.compute_type,
+                )
             )
-        )
-        result = engine.transcribe(
-            audio_path,
-            on_progress=lambda progress: notify("识别语音", 0.05 + 0.75 * progress),
-            should_cancel=should_cancel,
-        )
+            result = engine.transcribe(
+                audio_path,
+                on_progress=lambda progress: notify("识别语音", 0.05 + 0.75 * progress),
+                should_cancel=should_cancel,
+            )
+        resolved_size = engine.resolved_size
+
+        if config.cache_dir is not None:
+            try:
+                cache.save_asr_cache(
+                    config.cache_dir,
+                    source,
+                    result,
+                    asr_model=config.asr_model,
+                    source_lang=config.source_lang,
+                    resolved_size=resolved_size,
+                )
+            except OSError as exc:  # 缓存只是加速手段，失败不阻断输出
+                logger.warning("ASR 缓存写入失败（不影响本次输出）：%s", exc)
 
     doc = SubtitleDoc(
         source_lang=result.language,
@@ -143,20 +180,22 @@ def run(
         else:
             check_cancelled()
             notify("翻译文本", 0.86)
-            translator = create_translator(
+            own_translator = translator is None
+            engine_tr = translator or create_translator(
                 config.translator,
                 device=config.device,
                 compute_type=config.compute_type,
             )
             try:
-                translations = translator.translate(
+                translations = engine_tr.translate(
                     [seg.text for seg in doc.segments],
                     doc.source_lang,
                     config.target_lang,
                     should_cancel=should_cancel,
                 )
             finally:
-                translator.close()
+                if own_translator:
+                    engine_tr.close()
             if len(translations) != len(doc.segments):
                 raise RuntimeError("译文条数与字幕条数不一致，翻译结果不可用")
 
@@ -186,4 +225,4 @@ def run(
         outputs.append(writer.write_ass(doc, config.output_path_for(ass_name), mode=ass_mode))
     notify("完成", 1.0)
 
-    return PipelineResult(doc=doc, outputs=outputs, asr_model=engine.resolved_size, issues=issues)
+    return PipelineResult(doc=doc, outputs=outputs, asr_model=resolved_size, issues=issues)
