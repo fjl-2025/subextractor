@@ -29,6 +29,7 @@ class LanguageParams:
     max_duration: float
     cps_target: float
     no_line_break_before: tuple[str, ...] = ()
+    script: str = "latin"  # ea=东亚文字 / latin=拉丁文字（M6 ASS 分样式用）
 
 
 def load_languages(path: Path | None = None) -> dict[str, LanguageParams]:
@@ -48,6 +49,7 @@ def load_languages(path: Path | None = None) -> dict[str, LanguageParams]:
             max_duration=float(cfg.get("max_duration", defaults.get("max_duration", 7.0))),
             cps_target=float(cfg.get("cps_target", defaults.get("cps_target", 17))),
             no_line_break_before=tuple(cfg.get("no_line_break_before") or ()),
+            script=str(cfg.get("script", "latin")),
         )
     return result
 

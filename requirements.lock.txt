@@ -21,7 +21,7 @@ iniconfig==2.3.1
 Janome==0.5.0
 markdown-it-py==4.2.0
 mdurl==0.1.2
-numpy==2.5.4
+numpy==2.3.5
 onnxruntime==1.31.0
 packaging==26.3
 pefile==2024.8.26

@@ -132,6 +132,21 @@
 >   > exe 同级 `models/`；首启向导 `ui/wizard.py` 检测缺失并给中文放置指引。
 > - Janome 词典、faster-whisper 内置 Silero VAD、imageio-ffmpeg 二进制等
 >   通过 spec 的 `collect_all` 收进包；打包版实测 ja→en 全链路通过。
+>
+> 可选项实现（2026-10-16）：
+> - 可选 1 ASS 分样式：`languages.yaml` 增加 `script`（ea/latin），`writer.py`
+>   双语 ASS 用 Src/Dst 双样式——东亚文字用 Microsoft YaHei、拉丁用 Arial，
+>   译文行字号略小、淡黄，以 `{\rDst}` 行内切换；CLI/GUI 可开。
+> - 可选 2 术语表：`core/glossary.py`（UTF-8 TSV），翻译后对译文后处理
+>   替换——拉丁语按词边界+大小写不敏感、东亚语按子串，长词优先；
+>   CLI `--glossary` 与 GUI 术语表行接入，不动翻译引擎。
+> - 可选 3 硬字幕 OCR：`core/ocr.py`（PaddleOCR，可选 extras `.[ocr]`）——
+>   ffmpeg 抽画面底部帧 → 逐帧识别 → 文本相似度合并成 cue，接入既有
+>   断句/翻译/写出管线；CLI `run --ocr`、GUI 勾选、
+>   `fetch-model --kind ocr --lang ja` 预置模型到 `models/ocr/paddle`
+>   （含 det/rec/lang.txt）。实测合成 4 秒日文硬字幕视频：8 帧 → 2 条
+>   cue，时间轴与文本完全正确。注意 paddlepaddle 3.3 CPU 需
+>   `enable_mkldnn=False` 规避 MKLDNN/PIR 缺陷。
 
 **验收**
 - 干净机器上，模型预置后双击即可用

@@ -51,6 +51,12 @@ excludes = [
     "IPython",
     "notebook",
     "jupyter",
+    # OCR 是可选手动扩展（pip install .[ocr]），不随主包分发
+    "paddleocr",
+    "paddle",
+    "paddlepaddle",
+    "paddlex",
+    "cv2",
 ]
 
 common = dict(

@@ -14,6 +14,7 @@ venv/
 models/asr/*
 models/mt/*
 models/vad/*
+models/ocr/*
 !models/asr/.gitkeep
 !models/mt/.gitkeep
 !models/vad/.gitkeep

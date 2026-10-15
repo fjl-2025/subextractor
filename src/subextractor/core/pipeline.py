@@ -22,7 +22,7 @@ from typing import Callable
 from ..config import SUPPORTED_TARGET_LANGS, get_language_params
 from ..models import registry
 from ..utils.logging import get_logger
-from . import asr, cache, media, postcheck, segment, writer
+from . import asr, cache, glossary, media, ocr, postcheck, segment, writer
 from .errors import PipelineCancelled
 from .subtitle import SubtitleDoc
 from .translate import Translator, create_translator
@@ -41,7 +41,9 @@ class PipelineConfig:
     translator: str = "nllb"
     output_dir: Path | None = None
     emit_ass: bool = False
+    glossary_path: Path | None = None  # 术语表（TSV），对译文做后处理替换
     cache_dir: Path | None = None  # ASR 断点缓存目录；None 表示不启用
+    ocr_config: ocr.OcrConfig | None = None  # 非空时走画面硬字幕 OCR，跳过音轨+ASR
 
     def output_path_for(self, suffix: str) -> Path:
         """输出路径：默认与输入文件同目录、同名词。"""
@@ -96,67 +98,85 @@ def run(
     if not source.is_file():
         raise FileNotFoundError(f"输入文件不存在：{source}")
 
-    if config.cache_dir is not None:
-        cached = cache.load_asr_cache(
-            config.cache_dir, source, config.asr_model, config.source_lang
+    if config.ocr_config is not None:
+        # 硬字幕路径：不做音轨抽取与语音识别，也不写 ASR 缓存
+        notify("画面字幕提取", 0.0)
+        segments, language = ocr.extract_subtitles(
+            source,
+            config.ocr_config,
+            on_progress=lambda stage, progress: notify(stage, 0.05 + 0.75 * progress),
+            should_cancel=should_cancel,
         )
+        doc = SubtitleDoc(
+            source_lang=language,
+            target_lang=config.target_lang,
+            segments=segments,
+        )
+        doc.renumber()
+        resolved_size = None
+        logger.info("画面字幕提取完成：源语 %s，共 %d 条", language, len(doc.segments))
     else:
-        cached = None
-
-    if cached is not None:
-        result = cached.result
-        resolved_size = cached.resolved_size
-        notify("读取缓存", 0.1)
-    else:
-        # 音轨是中间产物，用临时目录承载，识别结束即清理（取消时同样清理）
-        with tempfile.TemporaryDirectory(prefix="subextractor-") as tmp:
-            notify("抽取音轨", 0.0)
-            check_cancelled()
-            audio_path = media.extract_audio(source, Path(tmp) / "audio.wav")
-            logger.info("音轨已抽取：%s", audio_path)
-
-            check_cancelled()
-            notify("识别语音", 0.05)
-            engine = asr_engine or asr.AsrEngine(
-                asr.AsrConfig(
-                    model_size=config.asr_model,
-                    source_lang=config.source_lang,
-                    device=config.device,
-                    compute_type=config.compute_type,
-                )
-            )
-            result = engine.transcribe(
-                audio_path,
-                on_progress=lambda progress: notify("识别语音", 0.05 + 0.75 * progress),
-                should_cancel=should_cancel,
-            )
-        resolved_size = engine.resolved_size
-
         if config.cache_dir is not None:
-            try:
-                cache.save_asr_cache(
-                    config.cache_dir,
-                    source,
-                    result,
-                    asr_model=config.asr_model,
-                    source_lang=config.source_lang,
-                    resolved_size=resolved_size,
-                )
-            except OSError as exc:  # 缓存只是加速手段，失败不阻断输出
-                logger.warning("ASR 缓存写入失败（不影响本次输出）：%s", exc)
+            cached = cache.load_asr_cache(
+                config.cache_dir, source, config.asr_model, config.source_lang
+            )
+        else:
+            cached = None
 
-    doc = SubtitleDoc(
-        source_lang=result.language,
-        target_lang=config.target_lang,
-        segments=result.segments,
-    )
-    doc.renumber()
-    logger.info(
-        "识别完成：源语 %s（置信度 %.2f），共 %d 条 ASR 分段",
-        result.language,
-        result.language_probability,
-        len(doc.segments),
-    )
+        if cached is not None:
+            result = cached.result
+            resolved_size = cached.resolved_size
+            notify("读取缓存", 0.1)
+        else:
+            # 音轨是中间产物，用临时目录承载，识别结束即清理（取消时同样清理）
+            with tempfile.TemporaryDirectory(prefix="subextractor-") as tmp:
+                notify("抽取音轨", 0.0)
+                check_cancelled()
+                audio_path = media.extract_audio(source, Path(tmp) / "audio.wav")
+                logger.info("音轨已抽取：%s", audio_path)
+
+                check_cancelled()
+                notify("识别语音", 0.05)
+                engine = asr_engine or asr.AsrEngine(
+                    asr.AsrConfig(
+                        model_size=config.asr_model,
+                        source_lang=config.source_lang,
+                        device=config.device,
+                        compute_type=config.compute_type,
+                    )
+                )
+                result = engine.transcribe(
+                    audio_path,
+                    on_progress=lambda progress: notify("识别语音", 0.05 + 0.75 * progress),
+                    should_cancel=should_cancel,
+                )
+            resolved_size = engine.resolved_size
+
+            if config.cache_dir is not None:
+                try:
+                    cache.save_asr_cache(
+                        config.cache_dir,
+                        source,
+                        result,
+                        asr_model=config.asr_model,
+                        source_lang=config.source_lang,
+                        resolved_size=resolved_size,
+                    )
+                except OSError as exc:  # 缓存只是加速手段，失败不阻断输出
+                    logger.warning("ASR 缓存写入失败（不影响本次输出）：%s", exc)
+
+        doc = SubtitleDoc(
+            source_lang=result.language,
+            target_lang=config.target_lang,
+            segments=result.segments,
+        )
+        doc.renumber()
+        logger.info(
+            "识别完成：源语 %s（置信度 %.2f），共 %d 条 ASR 分段",
+            result.language,
+            result.language_probability,
+            len(doc.segments),
+        )
 
     # 断句：按源语参数切分 + 规整时间轴（此后的 cue 即最终分段）
     check_cancelled()
@@ -198,6 +218,14 @@ def run(
                     engine_tr.close()
             if len(translations) != len(doc.segments):
                 raise RuntimeError("译文条数与字幕条数不一致，翻译结果不可用")
+
+            if config.glossary_path is not None:
+                entries = glossary.load(config.glossary_path)
+                if entries:
+                    translations = glossary.apply_all(
+                        translations, entries, config.target_lang
+                    )
+                    logger.info("术语表已应用：%d 条规则（%s）", len(entries), config.glossary_path)
 
             dst_params = get_language_params(config.target_lang)
             for seg, text in zip(doc.segments, translations):

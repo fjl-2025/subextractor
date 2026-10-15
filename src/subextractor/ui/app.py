@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..config import SUPPORTED_TARGET_LANGS
-from ..core import batch, pipeline
+from ..core import batch, ocr, pipeline
 from ..core.cache import default_cache_dir
 from ..core.errors import PipelineCancelled
 from ..core.pipeline import PipelineConfig, PipelineResult
@@ -231,12 +231,26 @@ class MainWindow(QMainWindow):
             0, "Argos 轻量备选引擎计划后续接入", Qt.ItemDataRole.ToolTipRole
         )
 
-        self.ass_check = QCheckBox("同时输出 ASS（基础样式）", opt_box)
+        self.ass_check = QCheckBox("同时输出 ASS（源语/译文分样式）", opt_box)
+        self.ocr_check = QCheckBox("画面硬字幕（OCR 提取，跳过语音识别）", opt_box)
+        self.ocr_check.setToolTip("用于无音轨/画面内嵌字幕的视频；需安装 OCR 扩展并预置模型")
+
+        glossary_row = QHBoxLayout()
+        self.glossary_edit = QLineEdit(opt_box)
+        self.glossary_edit.setPlaceholderText(
+            "术语表（可选，UTF-8 TSV：源词<TAB>目标词），翻译后对译文替换"
+        )
+        glossary_btn = QPushButton("浏览…", opt_box)
+        glossary_btn.clicked.connect(self._choose_glossary)
+        glossary_row.addWidget(self.glossary_edit, 1)
+        glossary_row.addWidget(glossary_btn)
         opts.addRow("源语", self.src_combo)
         opts.addRow("目标语", self.dst_combo)
         opts.addRow("ASR 档位", self.model_combo)
         opts.addRow("翻译引擎", self.engine_combo)
         opts.addRow("", self.ass_check)
+        opts.addRow("", self.ocr_check)
+        opts.addRow("术语表", glossary_row)
         root.addWidget(opt_box)
 
         # 操作 + 进度
@@ -343,6 +357,15 @@ class MainWindow(QMainWindow):
         if path:
             self.outdir_edit.setText(path)
 
+    def _choose_glossary(self) -> None:
+        if self._running:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择术语表（TSV：源词<TAB>目标词）", "", "术语表 (*.tsv *.txt);;所有文件 (*)"
+        )
+        if path:
+            self.glossary_edit.setText(path)
+
     # ------------------------------------------------------------------ 运行控制
 
     def _start(self) -> None:
@@ -361,6 +384,21 @@ class MainWindow(QMainWindow):
 
         outdir_text = self.outdir_edit.text().strip()
         outdir = Path(outdir_text) if outdir_text else None
+        glossary_text = self.glossary_edit.text().strip()
+        if glossary_text and not Path(glossary_text).is_file():
+            QMessageBox.warning(self, "术语表无效", f"文件不存在：{glossary_text}")
+            return
+        ocr_config = None
+        if self.ocr_check.isChecked():
+            if not ocr.ocr_available():
+                QMessageBox.warning(
+                    self,
+                    "OCR 扩展未安装",
+                    "画面硬字幕需要 OCR 扩展：pip install -e .[ocr]\n"
+                    "模型预置：subextractor fetch-model --kind ocr --lang ja",
+                )
+                return
+            ocr_config = ocr.OcrConfig(lang=self.src_combo.currentData() or "auto")
         common = {
             "source_lang": self.src_combo.currentData() or "auto",
             "target_lang": self.dst_combo.currentData() or None,
@@ -368,7 +406,9 @@ class MainWindow(QMainWindow):
             "translator": self.engine_combo.currentData() or "nllb",
             "output_dir": outdir,
             "emit_ass": self.ass_check.isChecked(),
+            "glossary_path": Path(glossary_text) if glossary_text else None,
             "cache_dir": default_cache_dir(outdir or files[0].parent),
+            "ocr_config": ocr_config,
         }
         configs = [PipelineConfig(input_path=file, **common) for file in files]
         self._open_dir = outdir or files[0].parent
@@ -534,6 +574,8 @@ class MainWindow(QMainWindow):
         s.setValue("asr_model", self.model_combo.currentData())
         s.setValue("engine", self.engine_combo.currentData())
         s.setValue("emit_ass", self.ass_check.isChecked())
+        s.setValue("use_ocr", self.ocr_check.isChecked())
+        s.setValue("glossary", self.glossary_edit.text().strip())
 
     def _load_settings(self) -> None:
         s = self._settings
@@ -551,6 +593,8 @@ class MainWindow(QMainWindow):
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
         self.ass_check.setChecked(s.value("emit_ass", False, type=bool))
+        self.ocr_check.setChecked(s.value("use_ocr", False, type=bool))
+        self.glossary_edit.setText(str(s.value("glossary") or ""))
 
     # ------------------------------------------------------------------ 首启向导
 

@@ -34,6 +34,10 @@ def _cmd_doctor(_: argparse.Namespace) -> int:
 
     installed = registry.installed_asr_sizes()
     print(f"CUDA 设备    : {registry.cuda_device_count()}")
+    from .core import ocr as ocr_mod
+
+    ocr_state = "已安装（paddleocr）" if ocr_mod.ocr_available() else "未安装（可选：pip install -e .[ocr]）"
+    print(f"OCR 扩展     : {ocr_state}")
     print(f"已装 ASR 档位: {', '.join(installed) if installed else '（无）'}")
     try:
         tier = registry.resolve_auto_tier()
@@ -52,9 +56,73 @@ def _cmd_doctor(_: argparse.Namespace) -> int:
     return 0
 
 
+def _latest_model_dir(cache_root: Path, keyword: str) -> Path | None:
+    """在 PaddleOCR 官方缓存里挑一个最新修改的 det/rec 模型目录。"""
+    if not cache_root.is_dir():
+        return None
+    candidates = [
+        p for p in cache_root.iterdir() if p.is_dir() and keyword in p.name.lower()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _fetch_ocr_model(lang: str) -> int:
+    """联网一次获取 PaddleOCR 推理模型到 models/ocr/paddle（之后完全离线）。
+
+    借助 PaddleOCR 官方下载机制：实例化即下载到 ``~/.paddlex/official_models``，
+    再把 det/rec 模型目录复制到本地模型根，并记录语言到 ``lang.txt``。
+    """
+    import shutil
+
+    from .core import ocr as ocr_mod
+
+    if lang not in ocr_mod.OCR_LANGS:
+        supported = " / ".join(sorted(ocr_mod.OCR_LANGS))
+        print(f"OCR 语言 {lang!r} 不支持（可选：{supported}）")
+        return 2
+    try:
+        from paddleocr import PaddleOCR
+    except ImportError:
+        print("缺少 OCR 扩展依赖：pip install -e .[ocr]")
+        return 2
+
+    ocr_lang = ocr_mod.OCR_LANGS[lang]
+    print(f"下载 PaddleOCR 推理模型（{ocr_lang}）…")
+    PaddleOCR(
+        lang=ocr_lang,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        enable_mkldnn=False,  # 与 core.ocr 保持一致：规避 paddle 3.3 的 MKLDNN/PIR 缺陷
+    )
+
+    cache_root = Path.home() / ".paddlex" / "official_models"
+    det = _latest_model_dir(cache_root, "det")
+    rec = _latest_model_dir(cache_root, "rec")
+    if det is None or rec is None:
+        print(f"未在 {cache_root} 找到已下载的 det/rec 模型")
+        return 1
+
+    target = registry.ocr_model_dir()
+    for name, src_dir in (("det", det), ("rec", rec)):
+        dst = target / name
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src_dir, dst)
+        print(f"  {name}: {src_dir.name} → {dst}")
+    (target / ocr_mod.LANG_FILE).write_text(lang + "\n", encoding="utf-8")
+    print(f"完成：OCR 模型已就绪（源语 {lang}），后续完全离线。")
+    return 0
+
+
 def _cmd_fetch_model(args: argparse.Namespace) -> int:
     """从 Hugging Face 取模型到本地 models 目录（仅需一次，之后完全离线）。"""
     kind = getattr(args, "kind", "asr")
+
+    if kind == "ocr":
+        return _fetch_ocr_model(getattr(args, "lang", "ja"))
 
     if kind == "mt":
         try:
@@ -102,6 +170,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 2
 
     out_base = Path(args.output_dir) if args.output_dir else None
+    glossary_path = Path(args.glossary) if getattr(args, "glossary", None) else None
+    if glossary_path is not None and not glossary_path.is_file():
+        print(f"失败：术语表不存在：{glossary_path}")
+        return 2
+
+    ocr_config = None
+    if getattr(args, "ocr", False):
+        from .core import ocr as ocr_mod
+
+        if not ocr_mod.ocr_available():
+            print("OCR 扩展未安装：pip install -e .[ocr]，然后 fetch-model --kind ocr")
+            return 2
+        ocr_config = ocr_mod.OcrConfig(
+            lang=args.src,
+            interval=args.ocr_interval,
+            roi_bottom=args.ocr_roi,
+        )
+
     cache_dir = None if args.no_resume else default_cache_dir(out_base or files[0].parent)
 
     def on_progress(stage: str, progress: float) -> None:
@@ -119,7 +205,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
             compute_type=args.compute_type,
             translator=args.translator,
             output_dir=out_base,
+            glossary_path=glossary_path,
             cache_dir=cache_dir,
+            ocr_config=ocr_config,
         )
         try:
             result = run(config, on_progress=on_progress)
@@ -149,7 +237,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
             compute_type=args.compute_type,
             translator=args.translator,
             output_dir=out_base,
+            glossary_path=glossary_path,
             cache_dir=cache_dir,
+            ocr_config=ocr_config,
         )
         for file in files
     ]
@@ -210,9 +300,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("version", help="打印版本")
     sub.add_parser("doctor", help="自检环境与离线模型")
 
-    p_fetch = sub.add_parser("fetch-model", help="一次性联网获取模型到本地（ASR / MT）")
-    p_fetch.add_argument("--kind", default="asr", choices=["asr", "mt"], help="模型类别：asr=Whisper（默认）、mt=NLLB 翻译")
+    p_fetch = sub.add_parser("fetch-model", help="一次性联网获取模型到本地（ASR / MT / OCR）")
+    p_fetch.add_argument("--kind", default="asr", choices=["asr", "mt", "ocr"], help="模型类别：asr=Whisper（默认）、mt=NLLB 翻译、ocr=PaddleOCR 硬字幕")
     p_fetch.add_argument("--size", default="small", choices=list(registry.ASR_SIZES), help="ASR 档位（kind=asr 时有效）")
+    p_fetch.add_argument("--lang", default="ja", help="OCR 源语（kind=ocr 时有效）：ja / en / fr / ko / zh")
 
     p_run = sub.add_parser("run", help="视频/音频 → 源语/双语 SRT（输入可为文件或目录）")
     p_run.add_argument("--input", help="输入视频/音频文件，或包含媒体文件的目录（批处理）")
@@ -232,6 +323,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="量化类型；auto = CPU 用 int8、CUDA 用 float16（默认）",
     )
     p_run.add_argument("--output-dir", default=None, help="输出目录，默认与输入同目录")
+    p_run.add_argument(
+        "--glossary",
+        default=None,
+        help="术语表文件（UTF-8 TSV：源词<TAB>目标词），翻译后对译文做后处理替换",
+    )
+    p_run.add_argument(
+        "--ocr",
+        action="store_true",
+        help="画面硬字幕模式：OCR 提取画面底部字幕，跳过音轨与语音识别（需 .[ocr] 扩展）",
+    )
+    p_run.add_argument("--ocr-interval", type=float, default=0.5, help="OCR 抽帧间隔秒（默认 0.5）")
+    p_run.add_argument(
+        "--ocr-roi",
+        type=float,
+        default=0.35,
+        help="OCR 字幕区域：画面底部占比（默认 0.35 = 底部 35%%）",
+    )
     p_run.add_argument(
         "--jobs",
         type=int,

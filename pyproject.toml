@@ -22,6 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 gui = ["PySide6>=6.6"]
 mt = ["sentencepiece>=0.2", "transformers>=4.40"]
+ocr = ["paddleocr>=3.0", "paddlepaddle>=3.0"]
 dev = ["pytest>=8.0", "ruff>=0.5", "pyinstaller>=6.0"]
 
 [project.scripts]

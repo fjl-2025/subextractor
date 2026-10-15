@@ -92,6 +92,13 @@ EXPECTED_MODELS: tuple[ModelSpec, ...] = (
         "Silero VAD：静音切分（faster-whisper 已内置，无需手动放置）",
         required=False,
     ),
+    ModelSpec(
+        "paddle-ocr",
+        "ocr",
+        "ocr/paddle",
+        "PaddleOCR：画面硬字幕提取（可选扩展，需 pip install .[ocr]）",
+        required=False,
+    ),
 )
 
 
@@ -206,6 +213,23 @@ def resolve_asr_model(size: str) -> Path:
 def nllb_model_dir() -> Path:
     """NLLB 翻译模型的本地目录：``models/mt/nllb-200-distilled-600M-ct2-int8``。"""
     return models_root() / MT_NLLB_DIR
+
+
+def ocr_model_dir() -> Path:
+    """PaddleOCR 推理模型的本地目录：``models/ocr/paddle``（含 det/rec 子目录）。"""
+    return models_root() / "ocr" / "paddle"
+
+
+def resolve_ocr_model() -> Path:
+    """返回已放置的 PaddleOCR 模型目录；缺失时抛 MissingModelError 并给出指引。"""
+    path = ocr_model_dir()
+    if not has_content(path / "det") or not has_content(path / "rec"):
+        raise MissingModelError(
+            f"未找到本地 OCR 模型（需含 det/ 与 rec/ 子目录）。\n"
+            f"期望目录：{path}\n"
+            f"首次获取（需联网一次）：subextractor fetch-model --kind ocr --lang ja"
+        )
+    return path
 
 
 def resolve_nllb_model() -> Path:

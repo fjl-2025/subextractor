@@ -11,7 +11,7 @@ import pytest
 
 from subextractor import __version__
 from subextractor.config import SUPPORTED_TARGET_LANGS, LanguageParams, load_languages
-from subextractor.core import batch, cache, postcheck, segment, translate, writer
+from subextractor.core import batch, cache, glossary, ocr, postcheck, segment, translate, writer
 from subextractor.core.asr import AsrResult
 from subextractor.core.pipeline import PipelineConfig, PipelineResult, run
 from subextractor.core.subtitle import Segment, SubtitleDoc, Word
@@ -52,6 +52,40 @@ def test_write_target_only_srt(tmp_path: Path) -> None:
     text = out.read_text(encoding="utf-8-sig")
     assert "こんにちは世界" in text
     assert "Hello world" not in text
+
+
+def test_ass_bilingual_uses_script_specific_styles(tmp_path: Path) -> None:
+    """双语 ASS：东亚源语用 CJK 字体，拉丁译文用西文字体，行内切换 Dst 样式。"""
+    doc = SubtitleDoc(source_lang="ja", target_lang="en")
+    doc.segments.append(
+        Segment(1, "こんにちは", 0.0, 1.5, translation="Hello there")
+    )
+    out = writer.write_ass(doc, tmp_path / "a.bilingual.en.ass", mode="bilingual")
+
+    text = out.read_text(encoding="utf-8-sig")
+    assert "Style: Src,Microsoft YaHei,44" in text  # 东亚源语样式
+    assert "Style: Dst,Arial,34" in text  # 拉丁译文样式（字号略小）
+    assert "\\N{\\rDst}Hello there" in text  # 译文行行内切换样式
+
+
+def test_ass_latin_pair_uses_latin_styles(tmp_path: Path) -> None:
+    doc = SubtitleDoc(source_lang="en", target_lang="fr")
+    doc.segments.append(Segment(1, "Hello", 0.0, 1.0, translation="Bonjour"))
+    out = writer.write_ass(doc, tmp_path / "a.ass", mode="bilingual")
+
+    text = out.read_text(encoding="utf-8-sig")
+    assert "Style: Src,Arial,40" in text
+    assert "Style: Dst,Arial,34" in text
+    assert "Microsoft YaHei" not in text
+
+
+def test_ass_unknown_language_falls_back_to_latin(tmp_path: Path) -> None:
+    doc = SubtitleDoc(source_lang="sw", target_lang="en")
+    doc.segments.append(Segment(1, "Habari", 0.0, 1.0, translation="Hello"))
+    out = writer.write_ass(doc, tmp_path / "a.ass", mode="bilingual")
+
+    text = out.read_text(encoding="utf-8-sig")
+    assert "Style: Src,Arial,40" in text
 
 
 def test_nllb_language_code_mapping() -> None:
@@ -377,3 +411,140 @@ def test_models_root_frozen_default_and_override(
         assert registry.models_root() == custom.resolve()
     finally:
         registry.override_file().unlink(missing_ok=True)
+
+
+def test_glossary_load_parses_tsv_and_sorts_by_length(tmp_path: Path) -> None:
+    g = tmp_path / "g.tsv"
+    g.write_text("# 注释行\n\nAPI\t应用程序接口\nOpenAI API\t开放接口\n", encoding="utf-8")
+
+    entries = glossary.load(g)
+
+    assert entries == [("OpenAI API", "开放接口"), ("API", "应用程序接口")]
+
+
+def test_glossary_load_rejects_bad_lines(tmp_path: Path) -> None:
+    g = tmp_path / "g.tsv"
+    g.write_text("只有一列\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        glossary.load(g)
+    with pytest.raises(FileNotFoundError):
+        glossary.load(tmp_path / "missing.tsv")
+
+
+def test_glossary_apply_latin_word_boundary_case_insensitive() -> None:
+    entries = [("AI", "人工智能"), ("the cloud", "云端")]
+    text = "EMAIL and AI are not the cloud, ai."
+
+    out = glossary.apply(text, entries, "en")
+
+    assert "EMAIL" in out  # 词边界：不命中 EMAIL 中的 AI
+    assert "人工智能 are not 云端, 人工智能." in out  # 大小写不敏感，统一用表中写法
+
+
+def test_glossary_apply_east_asian_substring() -> None:
+    entries = [("変換速度", "转换速度"), ("変換", "转换")]
+
+    assert glossary.apply("変換速度を上げる", entries, "ja") == "转换速度を上げる"
+
+
+class _FakeTranslator:
+    name = "fake"
+
+    def translate(self, texts, src, dst, **kwargs):  # noqa: ANN001, ANN202
+        return [f"[{dst}] {text}" for text in texts]
+
+    def close(self) -> None:
+        pass
+
+
+def test_pipeline_applies_glossary_after_translation(tmp_path: Path) -> None:
+    """术语表在翻译后、写出前生效（译文被替换，源语行不受影响）。"""
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"x")
+    cache_dir = tmp_path / "cache"
+    cache.save_asr_cache(
+        cache_dir,
+        src,
+        AsrResult(
+            segments=[Segment(1, "this AI test", 0.0, 2.0)],
+            language="en",
+            language_probability=0.9,
+            duration=2.0,
+        ),
+        asr_model="small",
+        source_lang="auto",
+        resolved_size="small",
+    )
+    g = tmp_path / "glossary.fr.tsv"
+    g.write_text("AI\tIA\n", encoding="utf-8")
+
+    result = run(
+        PipelineConfig(
+            input_path=src,
+            target_lang="fr",
+            asr_model="small",
+            glossary_path=g,
+            cache_dir=cache_dir,
+        ),
+        translator=_FakeTranslator(),
+    )
+
+    target = next(p for p in result.outputs if p.name.endswith(".fr.srt"))
+    text = target.read_text(encoding="utf-8-sig")
+    assert "[fr] this IA test" in text
+    orig = next(p for p in result.outputs if p.name.endswith(".orig.srt"))
+    assert "this AI test" in orig.read_text(encoding="utf-8-sig")
+
+
+def test_ocr_merge_frames_groups_similar_and_drops_blink() -> None:
+    """相似帧合并为一条 cue（文本取高置信帧）；孤立短字幕帧被丢弃。"""
+    frames = [
+        (0.0, "こんにちは", 0.90),
+        (0.5, "こんにちは", 0.95),  # 同一条，文本取置信度高的
+        (1.0, "こんにちわ", 0.80),  # 1 字符差异，仍视为同一条
+        (1.5, "", 0.0),
+        (2.0, "世界へようこそ", 0.99),
+        (2.5, "世界へようこそ", 0.97),
+        (3.0, "", 0.0),
+        (3.5, "一帧闪现", 0.9),  # 仅持续 0.5s 的孤立帧
+        (4.0, "", 0.0),
+    ]
+
+    cues = ocr.merge_frames(frames, interval=0.5, min_duration=0.8)
+
+    assert len(cues) == 2
+    assert cues[0].text == "こんにちは" and cues[0].start == 0.0 and cues[0].end == 1.5
+    assert cues[1].text == "世界へようこそ" and cues[1].start == 2.0 and cues[1].end == 3.0
+
+
+def test_ocr_merge_frames_case_insensitive_for_latin() -> None:
+    frames = [(0.0, "Hello World", 0.9), (0.5, "hello world", 0.8)]
+
+    cues = ocr.merge_frames(frames, interval=0.5, min_duration=0.5)
+
+    assert len(cues) == 1
+    assert cues[0].text == "Hello World"  # 高置信帧的原文（大小写保留）
+    assert cues[0].end == 1.0
+
+
+def test_ocr_lang_resolution() -> None:
+    assert ocr._resolve_lang("ja", Path("x")) == "japan"
+    assert ocr._resolve_lang("en", Path("x")) == "en"
+    with pytest.raises(ValueError):
+        ocr._resolve_lang("de", Path("x"))
+
+
+def test_ocr_lang_from_model_dir_lang_file(tmp_path: Path) -> None:
+    (tmp_path / ocr.LANG_FILE).write_text("ko\n", encoding="utf-8")
+    assert ocr._resolve_lang("auto", tmp_path) == "korean"
+
+
+def test_ocr_missing_model_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(registry.ENV_MODELS_DIR, str(tmp_path))
+    with pytest.raises(registry.MissingModelError):
+        registry.resolve_ocr_model()
+    (registry.ocr_model_dir() / "det").mkdir(parents=True)
+    (registry.ocr_model_dir() / "det" / "inference.pdmodel").write_bytes(b"x")
+    (registry.ocr_model_dir() / "rec").mkdir(parents=True)
+    (registry.ocr_model_dir() / "rec" / "inference.pdmodel").write_bytes(b"x")
+    assert registry.resolve_ocr_model() == registry.ocr_model_dir()

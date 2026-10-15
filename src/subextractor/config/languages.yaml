@@ -4,6 +4,8 @@
 # - max_chars_per_line 为业界惯例参考值（Netflix 风格），M3 阶段用真实样本实测校准。
 # - no_line_break_before：禁止作为新行开头的字符（日/韩助词等），en/fr 为空。
 #   M3 起由 segment.py 在二次切分时使用。
+# - script：文字体系，ea=东亚（中日韩，无空格）、latin=拉丁；
+#   M6 起 ASS 输出按此区分字体/字号样式。
 
 defaults:
   max_lines: 2
@@ -15,15 +17,19 @@ languages:
   en:
     max_chars_per_line: 42
     no_line_break_before: []
+    script: latin
 
   fr:
     max_chars_per_line: 42
     no_line_break_before: []
+    script: latin
 
   ja:
     max_chars_per_line: 13 # 全角字符
     no_line_break_before: ["は", "が", "を", "に", "へ", "と", "で", "も", "の", "から", "まで"]
+    script: ea
 
   ko:
     max_chars_per_line: 16
     no_line_break_before: ["은", "는", "이", "가", "을", "를", "에", "에서", "으로", "로"]
+    script: ea
