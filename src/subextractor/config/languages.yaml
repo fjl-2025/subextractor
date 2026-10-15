@@ -1,0 +1,29 @@
+# 字幕断句与排版参数（设计大纲 §3 / §8）
+#
+# 说明：
+# - max_chars_per_line 为业界惯例参考值（Netflix 风格），M3 阶段用真实样本实测校准。
+# - no_line_break_before：禁止作为新行开头的字符（日/韩助词等），en/fr 为空。
+#   M3 起由 segment.py 在二次切分时使用。
+
+defaults:
+  max_lines: 2
+  min_duration: 0.8
+  max_duration: 7.0
+  cps_target: 17
+
+languages:
+  en:
+    max_chars_per_line: 42
+    no_line_break_before: []
+
+  fr:
+    max_chars_per_line: 42
+    no_line_break_before: []
+
+  ja:
+    max_chars_per_line: 13 # 全角字符
+    no_line_break_before: ["は", "が", "を", "に", "へ", "と", "で", "も", "の", "から", "まで"]
+
+  ko:
+    max_chars_per_line: 16
+    no_line_break_before: ["은", "는", "이", "가", "을", "를", "에", "에서", "으로", "로"]

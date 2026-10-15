@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "subextractor"
+version = "0.0.1"
+description = "离线桌面工具：视频 → 双语外挂字幕（en / fr / ja / ko）"
+readme = "docs/design-outline.md"
+requires-python = ">=3.10"
+# 许可待定（自用项目）
+dependencies = [
+    "faster-whisper>=1.0",
+    "ctranslate2>=4.0",
+    "pysrt>=1.1",
+    "PyYAML>=6.0",
+    "imageio-ffmpeg>=0.4",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.6"]
+mt = ["sentencepiece>=0.2", "transformers>=4.40"]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+subextractor = "subextractor.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/subextractor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
