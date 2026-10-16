@@ -233,9 +233,10 @@ class MainWindow(QMainWindow):
             self.src_combo.addItem(LANG_LABELS.get(lang, lang), lang)
 
         self.dst_combo = QComboBox(opt_box)
-        self.dst_combo.addItem("（仅源语字幕）", "")
         for lang in SUPPORTED_TARGET_LANGS:
             self.dst_combo.addItem(LANG_LABELS.get(lang, lang), lang)
+        # 「仅源语」置末：默认选中首项（中文），双击快捷方式即可直接产出中文+双语
+        self.dst_combo.addItem("（仅源语字幕，不翻译）", "")
 
         self.model_combo = QComboBox(opt_box)
 
@@ -668,7 +669,6 @@ class MainWindow(QMainWindow):
         self.outdir_edit.setText(str(s.value("output_dir") or ""))
         for combo, key in (
             (self.src_combo, "source_lang"),
-            (self.dst_combo, "target_lang"),
             (self.model_combo, "asr_model"),
             (self.engine_combo, "engine"),
         ):
@@ -677,6 +677,13 @@ class MainWindow(QMainWindow):
                 idx = combo.findData(value)
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
+        # 目标语为空（旧版本默认「仅源语」残留的设置）时视为未设置，
+        # 保留「中文（简体）」默认，避免继续只出源语字幕
+        saved_target = s.value("target_lang")
+        if saved_target:
+            idx = self.dst_combo.findData(saved_target)
+            if idx >= 0:
+                self.dst_combo.setCurrentIndex(idx)
         self.ass_check.setChecked(s.value("emit_ass", False, type=bool))
         self.ocr_check.setChecked(s.value("use_ocr", False, type=bool))
         self.glossary_edit.setText(str(s.value("glossary") or ""))

@@ -231,7 +231,11 @@ def run(
 
             dst_params = get_language_params(config.target_lang)
             for seg, text in zip(doc.segments, translations):
-                seg.translation = segment.wrap_text(text or seg.text, dst_params)
+                clean = text or seg.text
+                if config.target_lang == "zh":
+                    # NLLB 输出中文时用半角标点，按简体字幕规范统一为全角
+                    clean = segment.normalize_cjk_punctuation(clean)
+                seg.translation = segment.wrap_text(clean, dst_params)
             translated = True
             logger.info(
                 "翻译完成：%s → %s，共 %d 条", doc.source_lang, config.target_lang, len(translations)

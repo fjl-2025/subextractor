@@ -682,3 +682,82 @@ def test_ocr_missing_model_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     (registry.ocr_model_dir() / "rec").mkdir(parents=True)
     (registry.ocr_model_dir() / "rec" / "inference.pdmodel").write_bytes(b"x")
     assert registry.resolve_ocr_model() == registry.ocr_model_dir()
+
+
+def test_chinese_wrap_avoids_particle_at_line_start() -> None:
+    """中文折行不得把「的」等助词甩到行首（避免在「附近的」中间断开）。"""
+    params = load_languages()["zh"]
+    text = "我们建议您在附近的餐厅品尝当地菜。"  # 17 字，折点若落在「的」前即违规
+    wrapped = segment.wrap_text(text, params)
+
+    for line in wrapped.split("\n")[1:]:
+        assert segment.first_unit(line, "zh") not in params.no_line_break_before
+    assert "附近的" in wrapped.replace("\n", "")  # 词本身未被拆散
+
+
+def test_normalize_cjk_punctuation_converts_halfwidth() -> None:
+    """中文译文里的半角标点应转成全角。"""
+    assert segment.normalize_cjk_punctuation("你好,世界!") == "你好，世界！"
+    assert segment.normalize_cjk_punctuation("a? b; c:") == "a？ b； c："
+
+
+def test_normalize_cjk_punctuation_protects_numbers_and_abbreviations() -> None:
+    """数字内部（小数点/时刻）与英文缩写里的点号不应被转换。"""
+    out = segment.normalize_cjk_punctuation("圆周率是3.5,时间是10:30,见U.S.A.")
+    assert "3.5" in out  # 小数点保留
+    assert "10:30" in out  # 时刻冒号保留
+    assert "U.S.A" in out  # 英文缩写内部点号保留（句末的点转句号）
+    assert "，" in out  # 作为分隔的逗号仍转全角
+
+
+class _HalfwidthZhTranslator:
+    name = "fake-zh"
+
+    def translate(self, texts, src, dst, **kwargs):
+        return ["你好,世界.这是3.5倍." for _ in texts]
+
+    def close(self) -> None:
+        pass
+
+
+def test_pipeline_normalizes_chinese_punctuation(tmp_path: Path) -> None:
+    """目标语为中文时，管线写出的译文标点应为全角，数字不受影响。"""
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"x")
+    cache_dir = tmp_path / "cache"
+    cache.save_asr_cache(
+        cache_dir,
+        src,
+        AsrResult(
+            segments=[Segment(1, "hello world", 0.0, 2.0)],
+            language="en",
+            language_probability=0.9,
+            duration=2.0,
+        ),
+        asr_model="small",
+        source_lang="auto",
+        resolved_size="small",
+    )
+
+    result = run(
+        PipelineConfig(
+            input_path=src,
+            target_lang="zh",
+            asr_model="small",
+            cache_dir=cache_dir,
+        ),
+        translator=_HalfwidthZhTranslator(),
+    )
+
+    target = next(p for p in result.outputs if p.name.endswith(".zh.srt"))
+    raw = target.read_text(encoding="utf-8-sig")
+    # 只看正文行：剔除序号行与时间轴行（时间轴本身用半角逗号，会干扰断言）
+    body = [
+        line
+        for line in raw.splitlines()
+        if line.strip() and "-->" not in line and not line.strip().isdigit()
+    ]
+    text = "".join(body)
+    assert "，" in text and "。" in text  # 逗号/句号已全角
+    assert "3.5" in text  # 小数点未被误转
+    assert "," not in text and "." not in text.replace("3.5", "")

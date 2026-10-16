@@ -64,6 +64,36 @@ def resolve_params(lang: str) -> LanguageParams:
         )
 
 
+# 中文译文标点归一化表：NLLB 输出中文时用半角标点，需按简体字幕规范转全角
+_CJK_PUNCT_MAP = {",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "："}
+
+
+def normalize_cjk_punctuation(text: str) -> str:
+    """把中文译文里的半角标点转成全角（``，。？！；：``）。
+
+    保护两类例外，避免破坏原意：
+    - 数字内部：``3.5`` / ``1,000`` / ``10:30``
+    - 英文缩写：``U.S.A`` / ``e.g.``
+    """
+    out: list[str] = []
+    for index, char in enumerate(text):
+        repl = _CJK_PUNCT_MAP.get(char)
+        if repl is None:
+            out.append(char)
+            continue
+        prev = text[index - 1] if index else ""
+        nxt = text[index + 1] if index + 1 < len(text) else ""
+        both_digit = prev.isdigit() and nxt.isdigit()
+        if both_digit and prev.isascii() and nxt.isascii():
+            out.append(char)  # 数字内部：小数点 / 千分位 / 时刻
+            continue
+        if char == "." and prev.isascii() and prev.isalpha() and nxt.isascii() and nxt.isalpha():
+            out.append(char)  # 英文缩写（仅 ASCII 字母之间，汉字 isalpha 为真需排除）
+            continue
+        out.append(repl)
+    return "".join(out)
+
+
 def segment_document(segments: list[Segment], params: LanguageParams) -> list[Segment]:
     """断句主入口：切分 → 规整 → 重排编号。"""
     out = split_segments(segments, params)
@@ -130,6 +160,8 @@ def wrap_text(text: str, params: LanguageParams) -> str:
     ja_boundaries: set[int] = {end for _, end in _ja_units(cleaned)} if params.lang == "ja" else set()
 
     def head_after(pos: int) -> str:
+        if params.lang == "zh":
+            return cleaned[pos]  # 中文以单字为行首单元（与 first_unit 一致）
         if char_mode:
             nxt = min((b for b in ja_boundaries if b > pos), default=total)
             return cleaned[pos:nxt]
@@ -202,6 +234,8 @@ def _wrap_words(words: list, params: LanguageParams, sep: str) -> str:
         if pos < lo or pos > hi:
             continue
         nxt_unit = words[i + 1].text if i + 1 < len(words) else text[pos:].lstrip()
+        if params.lang == "zh":
+            nxt_unit = nxt_unit[:1]  # 中文行首单元为单字
         if _is_forbidden_head(nxt_unit.lstrip(), params):
             continue
         if best is None or key(pos) < key(best):
