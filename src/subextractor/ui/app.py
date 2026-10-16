@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -58,6 +59,7 @@ MEDIA_FILTER = "视频/音频 (*.mp4 *.mkv *.mov *.avi *.webm *.mp3 *.m4a *.wav 
 SOURCE_LANGS: tuple[str, ...] = ("auto", *SUPPORTED_TARGET_LANGS)
 LANG_LABELS = {
     "auto": "自动检测",
+    "zh": "中文（简体）",
     "en": "英语 English",
     "fr": "法语 Français",
     "ja": "日语 日本語",
@@ -167,12 +169,24 @@ class MainWindow(QMainWindow):
         self._running = False
         self._result: PipelineResult | None = None
         self._open_dir: Path | None = None
+        self._preview_doc: SubtitleDoc | None = None
 
         self._build_ui()
         self._build_menu()
         self._refresh_model_status()  # 先填充档位下拉，_load_settings 才能选中上次档位
         self._load_settings()
+        self._update_output_hint()
         QTimer.singleShot(150, self._maybe_show_wizard)  # 界面显示后再做首启模型检查
+
+    def _update_output_hint(self) -> None:
+        """目标语下拉下方的产物说明：选目标语即自动出双语，无需额外开关。"""
+        if self.dst_combo.currentData():
+            self.output_hint.setText(
+                "选定目标语后自动产出三个文件：源语 .orig.srt、纯译文 .<语言>.srt、"
+                "双语对照（与视频同名 .srt，播放器打开视频即自动外挂）。"
+            )
+        else:
+            self.output_hint.setText("仅输出源语字幕，不翻译（只生成 .orig.srt）。")
 
     # ------------------------------------------------------------------ 菜单
 
@@ -202,7 +216,7 @@ class MainWindow(QMainWindow):
         io.addWidget(dir_btn, 0, 3)
 
         self.outdir_edit = QLineEdit(io_box)
-        self.outdir_edit.setPlaceholderText("默认与输入文件同目录")
+        self.outdir_edit.setPlaceholderText("留空 = 输出到视频旁边（推荐：与视频同名可自动外挂）")
         outdir_btn = QPushButton("浏览…", io_box)
         outdir_btn.clicked.connect(self._choose_outdir)
         io.addWidget(QLabel("输出目录", io_box), 1, 0)
@@ -246,6 +260,11 @@ class MainWindow(QMainWindow):
         glossary_row.addWidget(glossary_btn)
         opts.addRow("源语", self.src_combo)
         opts.addRow("目标语", self.dst_combo)
+        self.output_hint = QLabel("", opt_box)
+        self.output_hint.setWordWrap(True)
+        self.output_hint.setStyleSheet("color: #666; font-size: 12px;")
+        self.dst_combo.currentIndexChanged.connect(self._update_output_hint)
+        opts.addRow("", self.output_hint)
         opts.addRow("ASR 档位", self.model_combo)
         opts.addRow("翻译引擎", self.engine_combo)
         opts.addRow("", self.ass_check)
@@ -263,9 +282,13 @@ class MainWindow(QMainWindow):
         self.open_btn = QPushButton("打开输出目录", central)
         self.open_btn.setEnabled(False)
         self.open_btn.clicked.connect(self._open_output_dir)
+        self.preview_btn = QPushButton("预览对照字幕", central)
+        self.preview_btn.setEnabled(False)
+        self.preview_btn.clicked.connect(self._preview_subtitles)
         btns.addWidget(self.start_btn)
         btns.addWidget(self.cancel_btn)
         btns.addStretch(1)
+        btns.addWidget(self.preview_btn)
         btns.addWidget(self.open_btn)
         root.addLayout(btns)
 
@@ -419,9 +442,11 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.open_btn.setEnabled(False)
+        self.preview_btn.setEnabled(False)
         self.progress.setValue(0)
         self.stage_label.setText("准备中…")
         self._result = None
+        self._preview_doc = None
         self.table.setRowCount(0)
         if len(configs) > 1:
             self.notes.setPlainText("")
@@ -481,6 +506,8 @@ class MainWindow(QMainWindow):
         )
         if result.doc.target_lang:
             summary += f"｜目标语 {result.doc.target_lang}"
+        if result.main_output is not None:
+            summary += f"｜双语成品 {result.main_output.name}（与视频同名，直接外挂）"
         self.statusBar().showMessage(summary)
 
     def _on_failed(self, message: str) -> None:
@@ -542,6 +569,8 @@ class MainWindow(QMainWindow):
 
     def _fill_table_doc(self, doc: SubtitleDoc) -> None:
         segments = doc.segments
+        self._preview_doc = doc
+        self.preview_btn.setEnabled(bool(segments))
         self.table.setRowCount(len(segments))
         for row, seg in enumerate(segments):
             values = (
@@ -562,6 +591,62 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._open_dir)))
         elif self._result and self._result.outputs:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._result.outputs[0].parent)))
+
+    def _preview_subtitles(self) -> None:
+        """转换完成后现场对照：弹窗按最终排版展示源语/译文全文（不截断）。"""
+        doc = self._preview_doc
+        if doc is None or not doc.segments:
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("字幕对照预览（与写出文件内容一致）")
+        dlg.resize(860, 640)
+        layout = QVBoxLayout(dlg)
+
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("显示：", dlg))
+        mode = QComboBox(dlg)
+        mode.addItem("双语对照", "bilingual")
+        mode.addItem("仅源语", "src")
+        if doc.target_lang:
+            mode.addItem("仅译文", "dst")
+        bar.addWidget(mode)
+        bar.addStretch(1)
+        count_lbl = QLabel(f"{len(doc.segments)} 条", dlg)
+        bar.addWidget(count_lbl)
+        layout.addLayout(bar)
+
+        view = QPlainTextEdit(dlg)
+        view.setReadOnly(True)
+        mono = view.font()
+        mono.setFamily("Consolas")
+        view.setFont(mono)
+        layout.addWidget(view, 1)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        close_btn = QPushButton("关闭", dlg)
+        close_btn.clicked.connect(dlg.accept)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+        def render() -> None:
+            m = mode.currentData()
+            blocks: list[str] = []
+            for seg in doc.segments:
+                header = f"#{seg.index}  {_fmt_clock(seg.start)} → {_fmt_clock(seg.end)}"
+                if m == "src":
+                    body = seg.text
+                elif m == "dst":
+                    body = seg.translation or ""
+                else:  # bilingual：与双语 SRT 同样的上下排列
+                    body = seg.text + (f"\n{seg.translation}" if seg.translation else "")
+                blocks.append(f"{header}\n{body}")
+            view.setPlainText("\n\n".join(blocks))
+
+        mode.currentIndexChanged.connect(render)
+        render()
+        dlg.exec()
 
     # ------------------------------------------------------------------ 配置持久化
 

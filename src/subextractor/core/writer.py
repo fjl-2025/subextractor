@@ -2,10 +2,13 @@
 
 输出约定：
 - ``name.orig.srt``           源语字幕
-- ``name.<lang>.srt``         目标语字幕
-- ``name.bilingual.<lang>.srt`` 双语（第 1 行源语、第 2 行译文）
-- ``name.bilingual.<lang>.ass`` 双语 ASS：源语/译文分样式（M6 起按东亚/拉丁
-  文字体系分别设定字体与字号，译文用 ``{\rDst}`` 行内覆写）
+- ``name.<lang>.srt``         目标语字幕（如 name.zh.srt）
+- ``name.srt``                双语成品（第 1 行源语、第 2 行译文）；
+                              与视频同名，播放器打开视频时自动作为外挂字幕加载
+- ``name.ass``                双语 ASS 成品（勾选输出时）：源语/译文分样式（M6 起
+                              按东亚/拉丁文字体系分别设定字体与字号，译文用
+                              ``{\rDst}`` 行内覆写）
+- 仅源语模式（不翻译）下 ASS 输出为 ``name.orig.ass``
 
 M0 先实现 SRT；M4 起附带基础 ASS；M6 起 ASS 支持东亚/拉丁分样式；
 VTT 仍未实现。
@@ -23,6 +26,27 @@ DEFAULT_ENCODING = "utf-8-sig"
 
 # source：仅源语；target：仅译文；bilingual：源语行 + 译文行
 WriteMode = Literal["source", "target", "bilingual"]
+
+
+def backup_path_for(target: Path) -> Path:
+    """片源自带字幕的备份名：``name.srt`` → ``name.source.srt``。"""
+    return target.with_name(f"{target.stem}.source{target.suffix}")
+
+
+def backup_existing(target: Path) -> Path | None:
+    """写同名成品前保护已有的片源字幕。
+
+    目标文件已存在且备份尚不存在时，把旧文件**移动**为 ``name.source.<ext>``，
+    返回备份路径；备份已存在（通常是上次重跑，旧的已被本工具成品占用）时不动，
+    返回 ``None``，避免用本工具的产物覆盖最初那份片源字幕。
+    """
+    if not target.exists():
+        return None
+    backup = backup_path_for(target)
+    if backup.exists():
+        return None
+    target.rename(backup)
+    return backup
 
 
 def format_timestamp_srt(seconds: float) -> str:

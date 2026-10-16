@@ -15,7 +15,7 @@ CONFIG_DIR = Path(__file__).resolve().parent
 LANGUAGES_FILE = CONFIG_DIR / "languages.yaml"
 
 # 目标语范围（源语由 ASR 自动检测，不受此限制）
-SUPPORTED_TARGET_LANGS: tuple[str, ...] = ("en", "fr", "ja", "ko")
+SUPPORTED_TARGET_LANGS: tuple[str, ...] = ("zh", "en", "fr", "ja", "ko")
 
 
 @dataclass(slots=True)

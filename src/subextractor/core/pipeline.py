@@ -57,6 +57,8 @@ class PipelineResult:
     outputs: list[Path] = field(default_factory=list)
     asr_model: str | None = None  # 自动档位实际解析出的档位
     issues: list[postcheck.Issue] = field(default_factory=list)  # postcheck 报告，供 GUI 展示
+    # 与视频同名的双语成品（name.srt / name.ass）：播放器打开视频时自动外挂
+    main_output: Path | None = None
 
 
 ProgressCallback = Callable[[str, float], None]
@@ -239,18 +241,29 @@ def run(
     check_cancelled()
     notify("写入字幕", 0.97)
     outputs = [writer.write_srt(doc, config.output_path_for(".orig.srt"))]
+    main_output: Path | None = None
     if translated:
         lang = config.target_lang
         outputs.append(writer.write_srt(doc, config.output_path_for(f".{lang}.srt"), mode="target"))
-        outputs.append(
-            writer.write_srt(
-                doc, config.output_path_for(f".bilingual.{lang}.srt"), mode="bilingual"
-            )
-        )
+        # 双语成品（外+中）：与视频同名的 name.srt，播放器打开视频时自动外挂
+        main_path = config.output_path_for(".srt")
+        backed_up = writer.backup_existing(main_path)
+        if backed_up is not None:
+            logger.info("检测到同名外挂字幕，已备份片源字幕：%s", backed_up.name)
+        main_output = writer.write_srt(doc, main_path, mode="bilingual")
+        outputs.append(main_output)
     if config.emit_ass:
-        ass_name = f".bilingual.{lang}.ass" if translated else ".orig.ass"
-        ass_mode = "bilingual" if translated else "source"
-        outputs.append(writer.write_ass(doc, config.output_path_for(ass_name), mode=ass_mode))
+        if translated:
+            # 双语 ASS 同样同名输出（name.ass），需要分样式时由播放器优先加载
+            ass_path = config.output_path_for(".ass")
+            ass_backup = writer.backup_existing(ass_path)
+            if ass_backup is not None:
+                logger.info("检测到同名 ASS 字幕，已备份片源字幕：%s", ass_backup.name)
+            outputs.append(writer.write_ass(doc, ass_path, mode="bilingual"))
+        else:
+            outputs.append(writer.write_ass(doc, config.output_path_for(".orig.ass"), mode="source"))
     notify("完成", 1.0)
 
-    return PipelineResult(doc=doc, outputs=outputs, asr_model=resolved_size, issues=issues)
+    return PipelineResult(
+        doc=doc, outputs=outputs, asr_model=resolved_size, issues=issues, main_output=main_output
+    )

@@ -31,6 +31,24 @@ def test_languages_cover_four_targets() -> None:
     assert "は" in langs["ja"].no_line_break_before
     assert langs["ko"].max_chars_per_line == 16
     assert langs["en"].no_line_break_before == ()
+    assert langs["zh"].script == "ea"
+    assert 0 < langs["zh"].max_chars_per_line <= 16
+
+
+def test_chinese_wrap_is_char_level_and_respects_limit() -> None:
+    """中文无空格：长句按字符折行，每行不超过 max_chars_per_line，优先标点。"""
+    params = load_languages()["zh"]
+    text = "他说今天晚上我们一起去看电影然后再去吃饭好不好啊朋友"  # 28 字，无标点
+    wrapped = segment.wrap_text(text, params)
+    line1, line2 = wrapped.split("\n")
+    assert len(line1) <= params.max_chars_per_line
+    assert len(line2) <= params.max_chars_per_line
+    assert line1 + line2 == text
+
+    punct = "我们明天一起去公园散步，顺便在附近的咖啡馆喝杯咖啡聊聊最近发生的事情。"
+    wrapped_p = segment.wrap_text(punct, params)
+    assert "，" in wrapped_p.split("\n")[0]  # 折点优先落在逗号之后
+    assert segment.first_unit("你好世界", "zh") == "你"
 
 
 def test_write_bilingual_srt(tmp_path: Path) -> None:
@@ -92,6 +110,7 @@ def test_nllb_language_code_mapping() -> None:
     assert translate.to_nllb_code("en") == "eng_Latn"
     assert translate.to_nllb_code("ja") == "jpn_Jpan"
     assert translate.to_nllb_code("ko") == "kor_Hang"
+    assert translate.to_nllb_code("zh") == "zho_Hans"
     assert translate.to_nllb_code("eng_Latn") == "eng_Latn"  # 已是 FLORES 代码
     with pytest.raises(ValueError):
         translate.to_nllb_code("xx")
@@ -392,6 +411,102 @@ def test_pipeline_uses_asr_cache(tmp_path: Path) -> None:
     assert "hello" in text
 
 
+def test_pipeline_emits_same_stem_bilingual_sidecar(tmp_path: Path) -> None:
+    """翻译后产出与视频同名的 name.srt（外+中），播放器打开视频即自动外挂。"""
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"x")
+    cache_dir = tmp_path / "cache"
+    cache.save_asr_cache(
+        cache_dir,
+        src,
+        AsrResult(
+            segments=[Segment(1, "hi there", 0.0, 2.0)],
+            language="en",
+            language_probability=0.9,
+            duration=2.0,
+        ),
+        asr_model="small",
+        source_lang="auto",
+        resolved_size="small",
+    )
+
+    result = run(
+        PipelineConfig(
+            input_path=src, target_lang="zh", asr_model="small",
+            cache_dir=cache_dir, emit_ass=True,
+        ),
+        translator=_FakeTranslator(),
+    )
+
+    names = sorted(p.name for p in result.outputs)
+    assert names == ["clip.ass", "clip.orig.srt", "clip.srt", "clip.zh.srt"]
+    assert not any(".bilingual." in n for n in names), "旧的 .bilingual.<lang> 命名应已移除"
+
+    assert result.main_output == tmp_path / "clip.srt"
+    body = (tmp_path / "clip.srt").read_text(encoding="utf-8-sig")
+    assert "hi there" in body
+    assert "[zh] hi there" in body  # 译文行存在（外+中同一 cue）
+    cue = body.split("\n\n")[0]
+    assert cue.index("hi there") < cue.index("[zh]")  # 源语在上、译文在下
+
+    ass = (tmp_path / "clip.ass").read_text(encoding="utf-8-sig")
+    assert "Style: Src" in ass and "Style: Dst" in ass
+    assert ",Src,," in ass and "{\\rDst}[zh] hi there" in ass  # Src 事件内行内切换 Dst
+
+
+def test_backup_existing_moves_once_and_preserves_source(tmp_path: Path) -> None:
+    """同名成品写入前的片源字幕保护：首次备份、重跑不覆盖最初备份。"""
+    target = tmp_path / "clip.srt"
+
+    # 尚无文件：无需备份
+    assert writer.backup_existing(target) is None
+
+    target.write_text("片源自带英文字幕", encoding="utf-8")
+    backup = writer.backup_existing(target)
+    assert backup == tmp_path / "clip.source.srt"
+    assert not target.exists()
+    assert backup.read_text(encoding="utf-8") == "片源自带英文字幕"
+
+    # 重跑：成品已占用同名位、备份已存在 → 不再移动、不覆盖最初那份
+    target.write_text("本工具双语成品", encoding="utf-8")
+    assert writer.backup_existing(target) is None
+    assert backup.read_text(encoding="utf-8") == "片源自带英文字幕"
+
+
+def test_pipeline_backs_up_preexisting_same_stem_sidecar(tmp_path: Path) -> None:
+    """片源自带同名 name.srt 时，转换后原字幕备份为 name.source.srt，成品为双语。"""
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"x")
+    cache_dir = tmp_path / "cache"
+    cache.save_asr_cache(
+        cache_dir,
+        src,
+        AsrResult(
+            segments=[Segment(1, "hi there", 0.0, 2.0)],
+            language="en",
+            language_probability=0.9,
+            duration=2.0,
+        ),
+        asr_model="small",
+        source_lang="auto",
+        resolved_size="small",
+    )
+    bundled = tmp_path / "clip.srt"
+    bundled.write_text("TORRENT BUNDLED ENGLISH SUB", encoding="utf-8")
+
+    run(
+        PipelineConfig(
+            input_path=src, target_lang="zh", asr_model="small",
+            cache_dir=cache_dir,
+        ),
+        translator=_FakeTranslator(),
+    )
+
+    assert (tmp_path / "clip.source.srt").read_text(encoding="utf-8") == "TORRENT BUNDLED ENGLISH SUB"
+    body = bundled.read_text(encoding="utf-8-sig")
+    assert "hi there" in body and "[zh] hi there" in body  # 同名位已是双语成品
+
+
 def test_models_root_frozen_default_and_override(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -409,6 +524,25 @@ def test_models_root_frozen_default_and_override(
     registry.save_models_root_override(custom)
     try:
         assert registry.models_root() == custom.resolve()
+    finally:
+        registry.override_file().unlink(missing_ok=True)
+
+
+def test_models_root_override_tolerates_utf8_bom(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """models-path.txt 被记事本等工具保存为带 BOM 的 UTF-8 时仍生效。"""
+    monkeypatch.setattr(registry, "is_frozen", lambda: True)
+    exe_dir = tmp_path / "SubExtractor"
+    exe_dir.mkdir()
+    monkeypatch.setattr(registry.sys, "executable", str(exe_dir / "SubExtractor.exe"))
+    monkeypatch.delenv(registry.ENV_MODELS_DIR, raising=False)
+
+    custom = tmp_path / "my-models"
+    custom.mkdir()
+    registry.override_file().write_bytes(b"\xef\xbb\xbf" + str(custom).encode("utf-8"))
+    try:
+        assert registry.models_root() == custom
     finally:
         registry.override_file().unlink(missing_ok=True)
 

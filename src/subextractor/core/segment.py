@@ -124,9 +124,10 @@ def wrap_text(text: str, params: LanguageParams) -> str:
         overflow = max(0, pos - limit) + max(0, total - pos - limit)
         return (overflow, abs(pos - target))
 
-    char_mode = params.lang == "ja"
-    # 日文行首单元 = pos 到下一个文节边界；非日文 = 首个空格分词
-    ja_boundaries: set[int] = {end for _, end in _ja_units(cleaned)} if char_mode else set()
+    # 日/中无空格分词，按字符模式折行；文节边界仅日文可用（Janome）
+    char_mode = params.lang in ("ja", "zh")
+    # 日文行首单元 = pos 到下一个文节边界；中文/非日文 = 首个空格分词
+    ja_boundaries: set[int] = {end for _, end in _ja_units(cleaned)} if params.lang == "ja" else set()
 
     def head_after(pos: int) -> str:
         if char_mode:
@@ -160,7 +161,7 @@ def wrap_text(text: str, params: LanguageParams) -> str:
                     continue
             consider(pos)
 
-    # 第三优先（仅日文且文节边界全部失败）：任意字符位置
+    # 第三优先（日/中字符模式且无可用边界）：任意字符位置
     if best is None and char_mode:
         for pos in range(lo, hi + 1):
             consider(pos)
@@ -221,10 +222,10 @@ def _clean(text: str, lang: str) -> str:
 def _detect_sep(words: list, lang: str) -> str:
     """推断词与词之间的拼接分隔符。
 
-    日文无空格；其余语种若词文本已自带空白（Whisper 拉丁语系词带前导空格）
+    日/中无空格；其余语种若词文本已自带空白（Whisper 拉丁语系词带前导空格）
     则不再补空格，避免出现双空格。
     """
-    if lang == "ja":
+    if lang in ("ja", "zh"):
         return ""
     if any(word.text[:1].isspace() for word in words if word.text):
         return ""
@@ -247,7 +248,8 @@ def _is_forbidden_head(head: str, params: LanguageParams) -> bool:
 
 
 def first_unit(text: str, lang: str) -> str:
-    """返回文本开头的首个切分单元：ja 为首个文节，其余语种为首个空格分词。
+    """返回文本开头的首个切分单元：ja 为首个文节，zh 为首个汉字，
+    其余语种为首个空格分词。
 
     供 postcheck 对折行后的行做与折行一致的行首助词校验。
     """
@@ -259,6 +261,8 @@ def first_unit(text: str, lang: str) -> str:
         if spans:
             return cleaned[: spans[0][1]]
         return cleaned
+    if lang == "zh":
+        return cleaned[0]
     parts = cleaned.split()
     return parts[0] if parts else cleaned
 

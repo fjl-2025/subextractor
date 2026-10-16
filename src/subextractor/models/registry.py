@@ -123,7 +123,8 @@ def _read_override() -> Path | None:
     path = override_file()
     if not path.is_file():
         return None
-    text = path.read_text(encoding="utf-8").strip()
+    # utf-8-sig：兼容记事本等工具手动编辑时写入的 BOM
+    text = path.read_text(encoding="utf-8-sig").strip()
     if not text:
         return None
     candidate = Path(text)
